@@ -10,10 +10,21 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                full_name TEXT
+                full_name TEXT,
+                real_name TEXT,
+                district TEXT,
+                street TEXT,
+                status TEXT DEFAULT 'pending', -- 'pending', 'approved', 'blocked'
+                is_admin INTEGER DEFAULT 0
             )
         """)
         
+        # Добавляем колонки если их нет (для миграции)
+        for col, col_type in [("real_name", "TEXT"), ("district", "TEXT"), ("street", "TEXT"), ("status", "TEXT DEFAULT 'pending'"), ("is_admin", "INTEGER DEFAULT 0")]:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+            except: pass
+
         # Таблица книг
         await db.execute("""
             CREATE TABLE IF NOT EXISTS books (
@@ -85,15 +96,70 @@ async def init_db():
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         """)
+
+        # Таблица логов админа
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                action_type TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
-async def add_user(user_id, username, full_name):
+async def add_user(user_id, username, full_name, status='pending'):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
-            (user_id, username, full_name)
+            "INSERT OR IGNORE INTO users (user_id, username, full_name, status) VALUES (?, ?, ?, ?)",
+            (user_id, username, full_name, status)
         )
         await db.commit()
+
+async def update_user_profile(user_id, real_name, district, street):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET real_name = ?, district = ?, street = ? WHERE user_id = ?",
+            (real_name, district, street, user_id)
+        )
+        await db.commit()
+
+async def update_user_status(user_id, status):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
+        await db.commit()
+
+async def set_admin_status(user_id, is_admin):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET is_admin = ? WHERE user_id = ?", (1 if is_admin else 0, user_id))
+        await db.commit()
+
+async def get_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def get_all_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users") as cursor:
+            return await cursor.fetchall()
+
+async def log_admin_action(admin_id, action_type, details):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO admin_logs (admin_id, action_type, details) VALUES (?, ?, ?)",
+            (admin_id, action_type, details)
+        )
+        await db.commit()
+
+async def get_admin_logs(limit=50):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM admin_logs ORDER BY created_at DESC LIMIT ?", (limit,)) as cursor:
+            return await cursor.fetchall()
 
 async def add_book(owner_id, title, author, genre, tags, age_rating, description, photo_id):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -295,6 +361,11 @@ async def get_book_reviews(book_id):
         async with db.execute(query, (book_id,)) as cursor:
             return await cursor.fetchall()
 
+async def delete_review(review_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
+        await db.commit()
+
 async def create_booking(book_id, renter_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO bookings (book_id, renter_id) VALUES (?, ?)", (book_id, renter_id))
@@ -331,9 +402,12 @@ async def get_incoming_requests(owner_id):
         async with db.execute(query, (owner_id,)) as cursor:
             return await cursor.fetchall()
 
-async def delete_book(book_id, owner_id):
+async def delete_book(book_id, owner_id=None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM books WHERE id = ? AND owner_id = ?", (book_id, owner_id))
+        if owner_id:
+            await db.execute("DELETE FROM books WHERE id = ? AND owner_id = ?", (book_id, owner_id))
+        else:
+            await db.execute("DELETE FROM books WHERE id = ?", (book_id,))
         await db.commit()
 
 async def update_book_status(book_id, owner_id, status):
@@ -341,12 +415,18 @@ async def update_book_status(book_id, owner_id, status):
         await db.execute("UPDATE books SET status = ? WHERE id = ? AND owner_id = ?", (status, book_id, owner_id))
         await db.commit()
 
-async def update_book_info(book_id, owner_id, title, author, genre, tags, age_rating, description):
+async def update_book_info(book_id, title, author, genre, tags, age_rating, description, owner_id=None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE books SET title=?, author=?, genre=?, tags=?, age_rating=?, description=?
-            WHERE id=? AND owner_id=?
-        """, (title, author, genre, tags, age_rating, description, book_id, owner_id))
+        if owner_id:
+            await db.execute("""
+                UPDATE books SET title=?, author=?, genre=?, tags=?, age_rating=?, description=?
+                WHERE id=? AND owner_id=?
+            """, (title, author, genre, tags, age_rating, description, book_id, owner_id))
+        else:
+            await db.execute("""
+                UPDATE books SET title=?, author=?, genre=?, tags=?, age_rating=?, description=?
+                WHERE id=?
+            """, (title, author, genre, tags, age_rating, description, book_id))
         await db.commit()
 
 async def request_book_return(book_id, owner_id):
@@ -358,3 +438,44 @@ async def cancel_return_request(book_id, owner_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE books SET return_requested = 0 WHERE id = ? AND owner_id = ?", (book_id, owner_id))
         await db.commit()
+
+async def get_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        stats = {}
+        
+        # Общие цифры
+        async with db.execute("SELECT COUNT(*) FROM users WHERE status = 'approved'") as c:
+            stats['total_users'] = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM books") as c:
+            stats['total_books'] = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM movements WHERE event_type = 'transfer'") as c:
+            stats['total_transfers'] = (await c.fetchone())[0]
+
+        # Топ-5 популярных книг (по количеству перемещений)
+        query_top_books = """
+            SELECT b.title, COUNT(m.id) as count
+            FROM movements m
+            JOIN books b ON m.book_id = b.id
+            WHERE m.event_type = 'transfer'
+            GROUP BY m.book_id
+            ORDER BY count DESC
+            LIMIT 5
+        """
+        async with db.execute(query_top_books) as c:
+            stats['top_books'] = await c.fetchall()
+
+        # Топ-5 активных читателей (кто получил больше всего книг)
+        query_top_readers = """
+            SELECT u.real_name, u.username, COUNT(m.id) as count
+            FROM movements m
+            JOIN users u ON m.to_user_id = u.user_id
+            WHERE m.event_type = 'transfer'
+            GROUP BY m.to_user_id
+            ORDER BY count DESC
+            LIMIT 5
+        """
+        async with db.execute(query_top_readers) as c:
+            stats['top_readers'] = await c.fetchall()
+            
+        return stats

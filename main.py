@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
-from config import BOT_TOKEN
+from config import BOT_TOKEN, ADMIN_IDS
 from models import (
     init_db, add_user, add_book, get_all_books, 
     get_book, create_booking, get_user_books, get_user_bookings,
@@ -16,7 +16,9 @@ from models import (
     confirm_transfer, return_book, get_books_on_shelf,
     add_to_waitlist, get_waitlist, remove_from_waitlist,
     get_incoming_requests, reject_booking, get_book_history,
-    request_book_return, cancel_return_request, add_review, get_book_reviews
+    request_book_return, cancel_return_request, add_review, get_book_reviews,
+    update_user_profile, update_user_status, set_admin_status, get_user,
+    get_all_users, log_admin_action, delete_review, get_stats, get_admin_logs
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +33,10 @@ class AddBook(StatesGroup):
     waiting_for_isbn = State()
     waiting_for_title = State(); waiting_for_author = State(); waiting_for_genre = State()
     waiting_for_tags = State(); waiting_for_age_rating = State(); waiting_for_description = State(); waiting_for_photo = State()
+
+class Registration(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_district = State()
 
 async def fetch_book_by_isbn(isbn):
     isbn = "".join(filter(str.isdigit, isbn))
@@ -89,8 +95,8 @@ class AddReview(StatesGroup):
 def main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📚 Поиск книг"), KeyboardButton(text="➕ Добавить книгу")],
-        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="❓ Помощь")],
-        [KeyboardButton(text="🏠 Домой")]
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="🏠 Домой")]
     ], resize_keyboard=True)
 
 def get_genres_keyboard():
@@ -105,8 +111,70 @@ def get_age_ratings_keyboard():
 @dp.message(F.text == "🏠 Домой")
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear(); await add_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
-    await message.answer(f"Привет, {message.from_user.first_name}! 👋\nБот готов к работе.", reply_markup=main_menu())
+    await state.clear()
+    user = await get_user(message.from_user.id)
+    
+    # Авто-назначение админов из конфига
+    if message.from_user.id in ADMIN_IDS:
+        if not user:
+            await add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, status='approved')
+            await set_admin_status(message.from_user.id, True)
+            user = await get_user(message.from_user.id)
+        elif not user['is_admin']:
+            await set_admin_status(message.from_user.id, True)
+            await update_user_status(message.from_user.id, 'approved')
+            user = await get_user(message.from_user.id)
+
+    if not user:
+        await add_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+        await message.answer("👋 Привет! Чтобы начать пользоваться ботом, нужно заполнить небольшую анкету для вступления в клуб.\n\nКак вас зовут? (Имя и Фамилия):")
+        await state.set_state(Registration.waiting_for_name)
+        return
+
+    if user['status'] == 'pending':
+        if not user['real_name']:
+            await message.answer("Пожалуйста, заполните анкету для вступления.\n\nКак вас зовут?")
+            await state.set_state(Registration.waiting_for_name)
+        else:
+            await message.answer("⏳ Ваша заявка находится на рассмотрении у администраторов. Мы сообщим вам, когда доступ будет открыт!")
+        return
+    
+    if user['status'] == 'blocked':
+        await message.answer("⛔️ Ваш доступ к боту заблокирован администратором.")
+        return
+
+    await message.answer(f"Привет, {user['real_name'] or message.from_user.first_name}! 👋\nБот готов к работе.", reply_markup=main_menu())
+
+# --- Регистрация ---
+@dp.message(Registration.waiting_for_name)
+async def reg_name(message: types.Message, state: FSMContext):
+    await state.update_data(real_name=message.text.strip())
+    await message.answer("Ваш примерный район проживания (например, Centro, Ciudad Naranco):")
+    await state.set_state(Registration.waiting_for_district)
+
+@dp.message(Registration.waiting_for_district)
+async def reg_district(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    real_name = data['real_name']
+    district = message.text.strip()
+    
+    await update_user_profile(message.from_user.id, real_name, district, "")
+    await message.answer("✨ Спасибо! Ваша заявка отправлена администраторам. Ожидайте подтверждения.")
+    
+    # Уведомляем админов
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"adm_appr_{message.from_user.id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_rejt_{message.from_user.id}")
+    ]])
+    caption = f"🆕 <b>Новая заявка!</b>\n\n👤 Юзер: @{message.from_user.username}\n📝 Имя: {real_name}\n📍 Район: {district}"
+    for admin_id in ADMIN_IDS:
+        try: await bot.send_message(admin_id, caption, parse_mode="HTML", reply_markup=kb)
+        except: pass
+    await state.clear()
+
+async def is_approved(user_id):
+    user = await get_user(user_id)
+    return user and user['status'] == 'approved'
 
 # --- Добавление ---
 @dp.message(F.text.in_({"➕ Добавить книгу", "➕ Добавить свою книгу"}))
@@ -259,6 +327,14 @@ async def display_books(message, books, user_id):
         if waitlist and (b['owner_id'] == user_id or b['current_holder_id'] == user_id):
             q_names = ", ".join([f"@{w['username']}" if w['username'] else w['full_name'] for w in waitlist])
             cap += f"\n\n👥 <b>Очередь:</b> {q_names}"
+
+        # Админ-кнопки
+        user = await get_user(user_id)
+        if user and user['is_admin']:
+            buttons.append([
+                InlineKeyboardButton(text="⚙️ Ред. (Админ)", callback_data=f"edit_{b['id']}"),
+                InlineKeyboardButton(text="🗑 Уд. (Админ)", callback_data=f"delete_{b['id']}")
+            ])
 
         kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
         await message.answer_photo(photo=b['photo_id'], caption=cap, parse_mode="HTML", reply_markup=kb)
@@ -451,8 +527,24 @@ async def p_reviews(c: types.CallbackQuery):
             name = f"@{r['username']}" if r['username'] else r['full_name']
             date = r['created_at'].split()[0]
             text += f"👤 {name} ({date}):\n«{r['text']}»\n\n"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Написать отзыв", callback_data=f"addreview_{bid}")]])
+    kb_btns = [[InlineKeyboardButton(text="📝 Написать отзыв", callback_data=f"addreview_{bid}")]]
+    
+    # Админ-удаление отзывов
+    user = await get_user(c.from_user.id)
+    if user and user['is_admin'] and reviews:
+        for r in reviews:
+            name = f"@{r['username']}" if r['username'] else r['full_name']
+            kb_btns.append([InlineKeyboardButton(text=f"🗑 Уд. отзыв {name}", callback_data=f"adm_delrev_{r['id']}_{bid}")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_btns)
     await c.message.answer(text, parse_mode="HTML", reply_markup=kb); await c.answer()
+
+@dp.callback_query(F.data.startswith("adm_delrev_"))
+async def adm_delreview(c: types.CallbackQuery):
+    _, _, rid, bid = c.data.split("_"); rid = int(rid); bid = int(bid)
+    await delete_review(rid)
+    await log_admin_action(c.from_user.id, "delete_review", f"Review ID: {rid}")
+    await c.answer("Отзыв удален"); await p_reviews(c)
 
 @dp.callback_query(F.data.startswith("addreview_"))
 async def p_addreview_start(c: types.CallbackQuery, state: FSMContext):
@@ -580,6 +672,118 @@ async def p_c_canc(c: types.CallbackQuery): await c.answer("Отменено")
 @dp.message(F.text == "❓ Помощь")
 async def cmd_help(message: types.Message):
     await message.answer("📖 <b>Помощь по боту</b>\n\n1. Находите книги через «Поиск».\n2. Добавляйте свои через «Добавить книгу».\n3. Если книга занята — встаньте в очередь.\n4. Передать книгу можно прямо из «Моего профиля».\n\nПриятного чтения! 📚", parse_mode="HTML")
+
+@dp.message(F.text == "📊 Статистика")
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if not await is_approved(message.from_user.id): return
+    s = await get_stats()
+    
+    text = "📊 <b>Статистика нашего клуба</b>\n\n"
+    text += f"👥 Участников: {s['total_users']}\n"
+    text += f"📚 Книг в библиотеке: {s['total_books']}\n"
+    text += f"🔄 Всего обменов: {s['total_transfers']}\n\n"
+    
+    if s['top_books']:
+        text += "🔥 <b>Самые популярные книги:</b>\n"
+        for idx, b in enumerate(s['top_books'], 1):
+            text += f"{idx}. {b['title']} ({b['count']} раз)\n"
+        text += "\n"
+    else:
+        text += "🔥 <b>Самые популярные книги:</b>\n<i>Скоро здесь появятся любимцы клуба!</i>\n\n"
+        
+    if s['top_readers']:
+        text += "📖 <b>Самые активные читатели:</b>\n"
+        for idx, r in enumerate(s['top_readers'], 1):
+            name = r['real_name'] or r['username'] or "Anon"
+            text += f"{idx}. {name} ({r['count']} книг взял)\n"
+    else:
+        text += "📖 <b>Самые активные читатели:</b>\n<i>Станьте первым активным читателем!</i>\n"
+            
+    await message.answer(text, parse_mode="HTML")
+
+# --- Админка ---
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    user = await get_user(message.from_user.id)
+    if not user or not user['is_admin']: return
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Список юзеров", callback_data="adm_users")],
+        [InlineKeyboardButton(text="📜 Логи действий", callback_data="adm_logs")]
+    ])
+    await message.answer("🛡 <b>Панель администратора</b>", parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data == "adm_users")
+async def adm_users_list(c: types.CallbackQuery):
+    users = await get_all_users()
+    text = "👥 <b>Все пользователи:</b>\n\n"
+    for u in users:
+        icon = "✅" if u['status'] == 'approved' else ("⏳" if u['status'] == 'pending' else "🚫")
+        admin_at = " ⭐" if u['is_admin'] else ""
+        text += f"{icon} {u['real_name'] or 'Не указано'} (@{u['username'] or 'no_user'}){admin_at}\n"
+        text += f"└ 📍 {u['district'] or '-'}\n"
+        text += f"└ Действия: /u_{u['user_id']}\n\n"
+    await c.message.answer(text, parse_mode="HTML"); await c.answer()
+
+@dp.callback_query(F.data == "adm_logs")
+async def adm_logs_list(c: types.CallbackQuery):
+    logs = await get_admin_logs()
+    text = "📜 <b>Последние действия админов:</b>\n\n"
+    if not logs: text += "Логов пока нет."
+    else:
+        for l in logs:
+            text += f"🔹 {l['created_at']}\nID {l['admin_id']}: {l['action_type']}\n{l['details']}\n\n"
+    await c.message.answer(text, parse_mode="HTML"); await c.answer()
+
+@dp.message(F.text.startswith("/u_"))
+async def adm_user_detail(message: types.Message):
+    admin = await get_user(message.from_user.id)
+    if not admin or not admin['is_admin']: return
+    try:
+        uid = int(message.text.split("_")[1]); user = await get_user(uid)
+    except: return
+    if not user: return
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"adm_appr_{uid}"),
+         InlineKeyboardButton(text="🚫 Блокировать", callback_data=f"adm_block_{uid}")],
+        [InlineKeyboardButton(text="⭐ Сделать админом", callback_data=f"adm_make_{uid}")] if not user['is_admin'] else []
+    ])
+    text = f"👤 <b>Детали пользователя:</b>\n\nИмя: {user['real_name']}\nНик: @{user['username']}\nРайон: {user['district']}\nСтатус: {user['status']}"
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("adm_appr_"))
+async def adm_approve(c: types.CallbackQuery):
+    uid = int(c.data.split("_")[2])
+    await update_user_status(uid, 'approved')
+    await log_admin_action(c.from_user.id, "approve_user", f"User ID: {uid}")
+    try: await bot.send_message(uid, "🎉 Ваша заявка одобрена! Добро пожаловать в клуб. Теперь бот полностью доступен.")
+    except: pass
+    await c.message.edit_text("✅ Пользователь одобрен."); await c.answer()
+
+@dp.callback_query(F.data.startswith("adm_rejt_"))
+async def adm_reject(c: types.CallbackQuery):
+    uid = int(c.data.split("_")[2])
+    await update_user_status(uid, 'rejected')
+    await log_admin_action(c.from_user.id, "reject_user", f"User ID: {uid}")
+    try: await bot.send_message(uid, "😔 К сожалению, ваша заявка на вступление отклонена.")
+    except: pass
+    await c.message.edit_text("❌ Заявка отклонена."); await c.answer()
+
+@dp.callback_query(F.data.startswith("adm_block_"))
+async def adm_block(c: types.CallbackQuery):
+    uid = int(c.data.split("_")[2])
+    await update_user_status(uid, 'blocked')
+    await log_admin_action(c.from_user.id, "block_user", f"User ID: {uid}")
+    await c.message.edit_text("🚫 Пользователь заблокирован."); await c.answer()
+
+@dp.callback_query(F.data.startswith("adm_make_"))
+async def adm_make_admin(c: types.CallbackQuery):
+    uid = int(c.data.split("_")[2])
+    await set_admin_status(uid, True)
+    await log_admin_action(c.from_user.id, "make_admin", f"User ID: {uid}")
+    await c.message.edit_text("⭐ Пользователь назначен администратором."); await c.answer()
 
 async def main(): await init_db(); await dp.start_polling(bot)
 if __name__ == "__main__":
